@@ -1,0 +1,17 @@
+# Core server
+fastapi
+uvicorn[standard]
+websockets
+
+# Configuration
+pyyaml
+
+# Logging
+loguru
+
+# Audio
+soundfile
+pyaudio
+
+# Model download (one-off, used to fetch the GGUF into models/)
+huggingface_hub
