@@ -20,6 +20,7 @@ OVERLAY_DIR = Path(__file__).parent / "overlay"
 
 from .audio import AudioCapture
 from .asr import ASREngine
+from .keywords import KeywordEngine
 from .wordstream import WordEvent, WordStream
 
 
@@ -36,21 +37,30 @@ class Core:
         )
         self.asr = ASREngine(config, self.words)
         self.asr.set_audio_queue(self.audio.queue)
+        self.keywords = KeywordEngine(
+            config, self.words, dispatch=self._dispatch, broadcast=self.broadcast
+        )
         self.words_total = 0
+
+    async def _dispatch(
+        self, plugin: str, action: str, args: dict[str, Any]
+    ) -> None:
+        # Phase 6: routed through the PluginManager.
+        raise RuntimeError(f"no plugin manager wired (plugin {plugin!r})")
 
     def _on_word(self, event: WordEvent) -> None:
         if event.is_final:
             self.words_total += 1
-        self.broadcast(event)
+        self.broadcast({
+            "type": "word", "text": event.text,
+            "index": event.index, "is_final": event.is_final,
+        })
 
-    def broadcast(self, event: WordEvent) -> None:
+    def broadcast(self, payload: dict[str, Any]) -> None:
         """Push a word/trigger event to all connected overlay clients."""
-        payload = json.dumps(
-            {"type": "word", "text": event.text,
-             "index": event.index, "is_final": event.is_final}
-        )
+        data = json.dumps(payload)
         for client in list(self.clients):
-            asyncio.create_task(self._safe_send(client, payload))
+            asyncio.create_task(self._safe_send(client, data))
 
     @staticmethod
     async def _safe_send(client: WebSocket, payload: str) -> None:
@@ -82,8 +92,10 @@ def create_app(core: Core) -> FastAPI:
                     core.config["overlay"]["host"], core.config["overlay"]["port"])
         await core.audio.start()
         await core.asr.start()
-        # Phase 5+ background tasks (keyword engine, plugins) start here.
+        await core.keywords.start()
+        # Phase 6: plugin manager starts here.
         yield
+        await core.keywords.stop()
         await core.asr.stop()
         core.audio.stop()
         logger.info("logos shutdown complete")
