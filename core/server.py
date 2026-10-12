@@ -21,6 +21,7 @@ OVERLAY_DIR = Path(__file__).parent / "overlay"
 from .audio import AudioCapture
 from .asr import ASREngine
 from .keywords import KeywordEngine
+from .plugins import PluginManager
 from .wordstream import WordEvent, WordStream
 
 
@@ -37,16 +38,12 @@ class Core:
         )
         self.asr = ASREngine(config, self.words)
         self.asr.set_audio_queue(self.audio.queue)
+        self.plugins = PluginManager(config)
         self.keywords = KeywordEngine(
-            config, self.words, dispatch=self._dispatch, broadcast=self.broadcast
+            config, self.words, dispatch=self.plugins.dispatch,
+            broadcast=self.broadcast,
         )
         self.words_total = 0
-
-    async def _dispatch(
-        self, plugin: str, action: str, args: dict[str, Any]
-    ) -> None:
-        # Phase 6: routed through the PluginManager.
-        raise RuntimeError(f"no plugin manager wired (plugin {plugin!r})")
 
     def _on_word(self, event: WordEvent) -> None:
         if event.is_final:
@@ -80,6 +77,10 @@ class Core:
             },
             "words_total": self.words.total_words,
             "window": self.words.window_text,
+            "plugins": {
+                name: getattr(plugin, "connected", True)
+                for name, plugin in self.plugins.plugins.items()
+            },
         }
 
 
@@ -92,11 +93,12 @@ def create_app(core: Core) -> FastAPI:
                     core.config["overlay"]["host"], core.config["overlay"]["port"])
         await core.audio.start()
         await core.asr.start()
+        await core.plugins.start()
         await core.keywords.start()
-        # Phase 6: plugin manager starts here.
         yield
         await core.keywords.stop()
         await core.asr.stop()
+        await core.plugins.stop()
         core.audio.stop()
         logger.info("logos shutdown complete")
 
