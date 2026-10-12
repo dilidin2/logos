@@ -9,11 +9,14 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, WebSocket
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from loguru import logger
+
+OVERLAY_DIR = Path(__file__).parent / "overlay"
 
 from .audio import AudioCapture
 from .asr import ASREngine
@@ -90,6 +93,30 @@ def create_app(core: Core) -> FastAPI:
     @app.get("/health")
     async def health() -> JSONResponse:
         return JSONResponse(core.health_payload())
+
+    @app.get("/", response_class=Response)
+    async def index() -> Response:
+        return Response(
+            (OVERLAY_DIR / "index.html").read_text(encoding="utf-8"),
+            media_type="text/html",
+        )
+
+    @app.get("/overlay.css", response_class=Response)
+    async def overlay_css() -> Response:
+        return Response(
+            (OVERLAY_DIR / "overlay.css").read_text(encoding="utf-8"),
+            media_type="text/css",
+        )
+
+    @app.get("/overlay.js", response_class=Response)
+    async def overlay_js() -> Response:
+        config_json = json.dumps(core.config["overlay"])
+        js = (
+            (OVERLAY_DIR / "overlay.js")
+            .read_text(encoding="utf-8")
+            .replace("/*__CONFIG__*/{}", config_json)
+        )
+        return Response(js, media_type="application/javascript")
 
     @app.websocket("/ws")
     async def websocket_endpoint(ws: WebSocket) -> None:

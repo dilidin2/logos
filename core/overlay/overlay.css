@@ -1,0 +1,69 @@
+:root {
+  /* Overwritten at load time by the embedded config. */
+  --font-family: Inter, sans-serif;
+  --font-size: 42px;
+  --color: #ffffff;
+  --highlight-color: #ffd93d;
+}
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+}
+body {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  font-family: var(--font-family);
+  font-size: var(--font-size);
+}
+#words {
+  display: flex;
+  align-items: baseline;
+  white-space: nowrap;
+  padding: 0 24px;
+}
+.word {
+  color: var(--color);
+  opacity: 1;
+  margin-right: 0.35em;
+  transition: opacity 300ms ease, transform 300ms ease;
+  will-change: opacity, transform;
+}
+.word.latest {
+  color: var(--highlight-color);
+}
+.word.sliding-out {
+  opacity: 0 !important;
+  transform: translateX(-0.6em);
+}
+#badges {
+  position: fixed;
+  top: 18px;
+  right: 24px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  pointer-events: none;
+}
+.badge {
+  font-family: var(--font-family);
+  font-size: calc(var(--font-size) * 0.45);
+  font-weight: 600;
+  color: #000;
+  background: var(--highlight-color);
+  border-radius: 999px;
+  padding: 6px 16px;
+  opacity: 1;
+  animation: badge-life 2.2s ease forwards;
+}
+@keyframes badge-life {
+  0%   { opacity: 0; transform: translateY(-8px); }
+  12%  { opacity: 1; transform: translateY(0); }
+  70%  { opacity: 1; }
+  100% { opacity: 0; transform: translateY(-4px); }
+}
