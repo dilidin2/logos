@@ -1,107 +1,91 @@
 """Non-blocking microphone capture.
 
-A dedicated PortAudio thread reads 16 kHz mono PCM16 and pushes frames
-into an asyncio queue. If the consumer falls behind, frames are dropped
-(a throttled warning is logged) rather than blocking the capture thread
-(spec section 3).
+Uses sounddevice (PortAudio) with a callback on PortAudio's own thread;
+each 160 ms block is pushed into an asyncio queue. If the consumer lags,
+frames are dropped and a throttled warning is logged (spec section 3.3).
 """
 
 from __future__ import annotations
 
 import asyncio
-import asyncio.queues
-import queue
-import threading
 import time
+from typing import Any
 
+import sounddevice as sd
 from loguru import logger
 
-# asyncio's QueueFull is a distinct class in Python 3.13+.
-_FULL_ERRORS = (queue.Full, asyncio.queues.QueueFull)
-
-# 160 ms of 16 kHz mono PCM16 = 2560 samples = 5120 bytes.
-FRAME_SAMPLES = 2560
-FRAME_BYTES = FRAME_SAMPLES * 2
-SAMPLE_RATE = 16000
-CHANNELS = 1
+FRAME_DURATION_S = 0.16
+DROP_WARNING_INTERVAL_S = 5.0
 
 
 class AudioCapture:
-    """Captures microphone audio into an asyncio queue of PCM16 bytes."""
+    """Microphone capture feeding an asyncio queue of PCM16 frames."""
 
-    def __init__(self, max_queue_size: int = 64) -> None:
-        self.queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=max_queue_size)
+    def __init__(self, sample_rate: int = 16000, chunk_frames: int = 2560) -> None:
+        self.sample_rate = sample_rate
+        self.chunk_frames = chunk_frames
+        self.queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=64)
+        self._stream: sd.InputStream | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._thread: threading.Thread | None = None
-        self._stop = threading.Event()
-        self._dropped = 0
-        self._captured_frames = 0
-        self._last_drop_log = 0.0
-
-    @property
-    def captured_seconds(self) -> float:
-        return self._captured_frames * FRAME_SAMPLES / SAMPLE_RATE
+        self._frames_dropped = 0
+        self._last_drop_warning = 0.0
+        self._captured_seconds = 0.0
 
     @property
     def dropped_frames(self) -> int:
-        return self._dropped
+        return self._frames_dropped
+
+    @property
+    def captured_seconds(self) -> float:
+        return self._captured_seconds
 
     async def start(self) -> None:
-        """Start the capture thread (must be called from the event loop)."""
+        """Open the default input device and start capturing."""
         self._loop = asyncio.get_running_loop()
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True, name="audio-capture")
-        self._thread.start()
-        logger.info("Audio capture started ({} Hz mono, {} ms frames)",
-                    SAMPLE_RATE, FRAME_SAMPLES * 1000 // SAMPLE_RATE)
-
-    def stop(self) -> None:
-        """Signal the capture thread to stop and wait for it to exit."""
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=5.0)
-            self._thread = None
+        # Open + start off the event loop (PortAudio calls the callback
+        # from its own thread from this point on).
+        await self._loop.run_in_executor(None, self._open_stream)
         logger.info(
-            "Audio capture stopped (captured {:.1f}s, dropped {} frames)",
-            self.captured_seconds, self._dropped,
+            "Microphone opened (default input device, {} Hz mono)", self.sample_rate
         )
 
+    def _open_stream(self) -> None:
+        self._stream = sd.InputStream(
+            samplerate=self.sample_rate,
+            channels=1,
+            dtype="int16",
+            blocksize=self.chunk_frames,
+            callback=self._callback,
+        )
+        self._stream.start()
+
+    def _callback(self, indata: Any, frames: int, time_info: Any, status: Any) -> None:
+        # Copy: PortAudio reuses this buffer.
+        pcm16 = bytes(indata[:, 0])
+        self._captured_seconds += frames / self.sample_rate
+        assert self._loop is not None
+        self._loop.call_soon_threadsafe(self._push, pcm16)
+
     def _push(self, data: bytes) -> None:
-        """Queue a frame from the event loop; drop it when the queue is full."""
-        try:
-            self.queue.put_nowait(data)
-        except _FULL_ERRORS:
-            self._dropped += 1
-            self._log_drop()
+        if self.queue.full():
+            self._frames_dropped += 1
+            now = time.monotonic()
+            if now - self._last_drop_warning >= DROP_WARNING_INTERVAL_S:
+                self._last_drop_warning = now
+                logger.warning(
+                    "Audio consumer lagging: dropped {} frame(s)", self._frames_dropped
+                )
+            return
+        self.queue.put_nowait(data)
 
-    def _log_drop(self) -> None:
-        now = time.monotonic()
-        if now - self._last_drop_log >= 5.0:
-            logger.warning(
-                "ASR is falling behind: {} audio frame(s) dropped",
-                self._dropped,
-            )
-            self._last_drop_log = now
-
-    def _run(self) -> None:
-        import pyaudio  # imported here so the rest of the app loads without PortAudio
-
-        pa = pyaudio.PyAudio()
-        try:
-            stream = pa.open(
-                format=pyaudio.paInt16,
-                channels=CHANNELS,
-                rate=SAMPLE_RATE,
-                input=True,
-                frames_per_buffer=FRAME_SAMPLES,
-            )
-            logger.info("Microphone opened (default input device)")
-            while not self._stop.is_set():
-                data = stream.read(FRAME_SAMPLES, exception_on_overflow=False)
-                self._captured_frames += 1
-                # Non-blocking: drop audio if the consumer is behind.
-                self._loop.call_soon_threadsafe(self._push, data)
-            stream.stop_stream()
-            stream.close()
-        finally:
-            pa.terminate()
+    def stop(self) -> None:
+        if self._stream is not None:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
+        self._loop = None
+        logger.info(
+            "Audio capture stopped ({} s captured, {} frame(s) dropped)",
+            round(self._captured_seconds, 1),
+            self._frames_dropped,
+        )

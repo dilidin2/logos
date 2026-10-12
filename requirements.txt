@@ -12,7 +12,7 @@ loguru
 
 # Audio
 soundfile
-pyaudio
+sounddevice
 
 # Model download (one-off, used to fetch the GGUF into models/)
 huggingface_hub

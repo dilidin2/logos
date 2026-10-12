@@ -11,37 +11,21 @@ configurable keyword triggers to in-process plugins (e.g. OBS actions).
 Everything runs locally on this machine; the server binds to
 `127.0.0.1` only.
 
-## Requirements
-
-- openSUSE Tumbleweed (or any Linux with PortAudio)
-- Python 3.12+
-- System packages: `portaudio-devel` (for `pyaudio`)
-- `nemo-speech` (NVIDIA NeMo-Speech.cpp runtime), installed once:
-
-  ```sh
-  curl -fsSL https://github.com/NVIDIA/NeMo-Speech.cpp/raw/main/scripts/install.sh | sh
-  ```
-
 ## Setup
+
+One command does everything (system library, `nemo-speech` runtime,
+virtualenv, model download, initial config). Safe to re-run:
 
 ```sh
 cd ~/logos
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-
-# one-off model download (~708 MB) into models/
-.venv/bin/python -c "
-from huggingface_hub import hf_hub_download
-hf_hub_download(
-    repo_id='nvidia/nemotron-3.5-asr-streaming-0.6b',
-    filename='nemotron-3.5-asr-streaming-0.6b.q8_0.gguf',
-    local_dir='models',
-)"
-
-# configuration
-cp config/logos_config.yaml.example config/logos_config.yaml
+./install.sh
 $EDITOR config/logos_config.yaml
 ```
+
+- Supported distros: openSUSE (zypper), Debian/Ubuntu (apt), Arch (pacman)
+- Python 3.12+ required
+- The one-off model download is ~708 MB into `models/`
+- `nemo-speech` is installed to `~/.local/share/nemo-speech`
 
 ## Run
 
