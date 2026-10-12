@@ -80,10 +80,23 @@ Config key for chunk size when running the server:
   Ctrl-C stops it gracefully. The core will do its own PortAudio capture
   (spec §3) and feed the WebSocket, so `--live` is only a validation tool.
 
+## Endpointing (Phase 3 finding)
+
+- `completed` events are **not** emitted on their own: the server needs
+  the `--asr.endpointing.enable` flag (boolean flag, no value) at startup.
+  With it, each silence pause (≈ `endpointing_ms` in `session.update`,
+  800 ms used) finalizes an utterance and emits
+  `conversation.item.input_audio_transcription.completed`.
+- Without it, a final only arrives after a manual
+  `input_audio_buffer.commit` — unusable for a continuous mic stream.
+
 ## Quirks / notes
 
 - The realtime WS closes with code 1011 if a non-bytes frame is sent —
   keep audio frames strictly `bytes`.
+- RNNT token deltas sometimes detach punctuation from the word
+  (e.g. `. A sk` for `. Ask`); the ASR engine re-attaches punct-only
+  tokens to the next word.
 - `session.update` is rejected once audio has started.
 - The CLI downloads its own model cache; we bypass it by passing the local
   GGUF path explicitly (`--model <path>`).

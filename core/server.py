@@ -6,6 +6,8 @@ plugins) via the app lifespan. Binds to 127.0.0.1 only (spec section 9).
 
 from __future__ import annotations
 
+import asyncio
+import json
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -14,6 +16,8 @@ from fastapi.responses import JSONResponse
 from loguru import logger
 
 from .audio import AudioCapture
+from .asr import ASREngine
+from .wordstream import WordEvent, WordStream
 
 
 class Core:
@@ -22,19 +26,47 @@ class Core:
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
         self.audio = AudioCapture()
-        self.asr_loaded = False
+        self.clients: set[WebSocket] = set()
+        self.words = WordStream(
+            window_size=config["overlay"]["window_size"],
+            on_word=self._on_word,
+        )
+        self.asr = ASREngine(config, self.words)
+        self.asr.set_audio_queue(self.audio.queue)
         self.words_total = 0
+
+    def _on_word(self, event: WordEvent) -> None:
+        if event.is_final:
+            self.words_total += 1
+        self.broadcast(event)
+
+    def broadcast(self, event: WordEvent) -> None:
+        """Push a word/trigger event to all connected overlay clients."""
+        payload = json.dumps(
+            {"type": "word", "text": event.text,
+             "index": event.index, "is_final": event.is_final}
+        )
+        for client in list(self.clients):
+            asyncio.create_task(self._safe_send(client, payload))
+
+    @staticmethod
+    async def _safe_send(client: WebSocket, payload: str) -> None:
+        try:
+            await client.send_text(payload)
+        except Exception:
+            pass  # client disconnect is handled by its receive loop
 
     def health_payload(self) -> dict[str, Any]:
         return {
             "status": "ok",
-            "asr_loaded": self.asr_loaded,
+            "asr_loaded": self.asr.loaded,
             "audio": {
                 "captured_seconds": round(self.audio.captured_seconds, 1),
                 "queue_depth": self.audio.queue.qsize(),
                 "dropped_frames": self.audio.dropped_frames,
             },
-            "words_total": self.words_total,
+            "words_total": self.words.total_words,
+            "window": self.words.window_text,
         }
 
 
@@ -46,9 +78,10 @@ def create_app(core: Core) -> FastAPI:
         logger.info("logos starting (host {}:{})",
                     core.config["overlay"]["host"], core.config["overlay"]["port"])
         await core.audio.start()
-        # Phase 3+ background tasks (ASR loop, keyword engine, plugins)
-        # will be started here.
+        await core.asr.start()
+        # Phase 5+ background tasks (keyword engine, plugins) start here.
         yield
+        await core.asr.stop()
         core.audio.stop()
         logger.info("logos shutdown complete")
 
@@ -60,9 +93,17 @@ def create_app(core: Core) -> FastAPI:
 
     @app.websocket("/ws")
     async def websocket_endpoint(ws: WebSocket) -> None:
-        """Push word/trigger events to the overlay (wired in Phase 3+)."""
+        """Push word/trigger events to the overlay."""
         await ws.accept()
-        await ws.close()
+        core.clients.add(ws)
+        try:
+            # Keep the socket alive; sends are driven by core.broadcast.
+            while True:
+                await ws.receive_text()
+        except Exception:
+            pass
+        finally:
+            core.clients.discard(ws)
 
     return app
 
