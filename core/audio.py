@@ -9,11 +9,15 @@ into an asyncio queue. If the consumer falls behind, frames are dropped
 from __future__ import annotations
 
 import asyncio
+import asyncio.queues
 import queue
 import threading
 import time
 
 from loguru import logger
+
+# asyncio's QueueFull is a distinct class in Python 3.13+.
+_FULL_ERRORS = (queue.Full, asyncio.queues.QueueFull)
 
 # 160 ms of 16 kHz mono PCM16 = 2560 samples = 5120 bytes.
 FRAME_SAMPLES = 2560
@@ -62,6 +66,14 @@ class AudioCapture:
             self.captured_seconds, self._dropped,
         )
 
+    def _push(self, data: bytes) -> None:
+        """Queue a frame from the event loop; drop it when the queue is full."""
+        try:
+            self.queue.put_nowait(data)
+        except _FULL_ERRORS:
+            self._dropped += 1
+            self._log_drop()
+
     def _log_drop(self) -> None:
         now = time.monotonic()
         if now - self._last_drop_log >= 5.0:
@@ -83,16 +95,12 @@ class AudioCapture:
                 input=True,
                 frames_per_buffer=FRAME_SAMPLES,
             )
-            logger.info("Microphone opened: {}", stream.get_input_device_info_get())
+            logger.info("Microphone opened (default input device)")
             while not self._stop.is_set():
                 data = stream.read(FRAME_SAMPLES, exception_on_overflow=False)
                 self._captured_frames += 1
-                try:
-                    # Non-blocking: drop audio if the consumer is behind.
-                    self._loop.call_soon_threadsafe(self.queue.put_nowait, data)
-                except queue.Full:
-                    self._dropped += 1
-                    self._log_drop()
+                # Non-blocking: drop audio if the consumer is behind.
+                self._loop.call_soon_threadsafe(self._push, data)
             stream.stop_stream()
             stream.close()
         finally:
