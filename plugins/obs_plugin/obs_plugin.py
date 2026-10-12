@@ -31,6 +31,11 @@ class ObsPlugin(Plugin):
         self._stop = asyncio.Event()
 
     def setup(self, config: dict[str, Any]) -> None:
+        import logging
+
+        # The library logs full tracebacks for expected connection
+        # failures; the plugin logs those itself, more concisely.
+        logging.getLogger("obsws_python").setLevel(logging.CRITICAL)
         self._host = config.get("host", self._host)
         self._port = int(config.get("port", self._port))
         self._password = config.get("password", "")

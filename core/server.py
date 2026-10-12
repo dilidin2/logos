@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,7 @@ class Core:
 
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
+        self.started_at = time.monotonic()
         self.audio = AudioCapture()
         self.clients: set[WebSocket] = set()
         self.words = WordStream(
@@ -76,6 +78,10 @@ class Core:
                 "dropped_frames": self.audio.dropped_frames,
             },
             "words_total": self.words.total_words,
+            "words_per_sec": round(
+                self.words.total_words / max(time.monotonic() - self.started_at, 1.0),
+                2,
+            ),
             "window": self.words.window_text,
             "plugins": {
                 name: getattr(plugin, "connected", True)
