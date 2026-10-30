@@ -13,7 +13,9 @@ import asyncio
 import shutil
 import socket
 import subprocess
+import time
 from pathlib import Path
+from typing import Any
 
 import aiohttp
 import websockets
@@ -23,6 +25,18 @@ from .wordstream import WordStream
 
 LANGUAGE_MAP = {"en": "en-US", "it": "it-IT"}
 RECONNECT_BACKOFF_S = (1.0, 2.0, 5.0, 10.0)
+
+# Server stdout/stderr go here so a crash leaves a diagnosable trace
+# (append mode: previous runs' output is kept).
+SERVER_LOG_PATH = Path("logs") / "nemo-speech.log"
+
+# Consecutive server respawns allowed before giving up (a crash loop
+# means a model/config problem, not a random crash).
+MAX_SERVER_RESTARTS = 5
+
+
+class _RestartLimitReached(RuntimeError):
+    """Raised when the server crash-loop cap is hit; the ASR loop stops."""
 
 
 def _find_nemo_speech() -> str:
@@ -54,8 +68,10 @@ class ASREngine:
         self._asr_cfg = config["asr"]
         self._port: int | None = None
         self._proc: subprocess.Popen | None = None
+        self._proc_log: Any = None
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
+        self._restarts = 0
         self._partial = ""
         self._pending_punct = ""
         self._open_indices: list[int] = []
@@ -69,6 +85,16 @@ class ASREngine:
         self._task = asyncio.create_task(self._run(), name="asr-loop")
         logger.info("ASR engine started (nemo-speech on port {})", self._port)
 
+    @property
+    def server_pid(self) -> int | None:
+        """PID of the nemo-speech server process, if any."""
+        return self._proc.pid if self._proc is not None else None
+
+    @property
+    def server_alive(self) -> bool:
+        """Whether the nemo-speech server process is currently alive."""
+        return self._proc is not None and self._proc.poll() is None
+
     async def stop(self) -> None:
         self._stop.set()
         if self._task is not None:
@@ -80,11 +106,21 @@ class ASREngine:
             except subprocess.TimeoutExpired:
                 self._proc.kill()
             self._proc = None
+        if self._proc_log is not None:
+            self._proc_log.close()
+            self._proc_log = None
         logger.info("ASR engine stopped")
 
     def _spawn_server(self) -> None:
         binary = _find_nemo_speech()
         chunk_size_s = self._asr_cfg["chunk_size_ms"] / 1000
+        SERVER_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self._proc_log = open(SERVER_LOG_PATH, "a", encoding="utf-8")
+        self._proc_log.write(
+            f"\n=== nemo-speech spawn {time.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"port {self._port} ===\n"
+        )
+        self._proc_log.flush()
         self._proc = subprocess.Popen(
             [
                 binary, "serve",
@@ -97,8 +133,8 @@ class ASREngine:
                 # silence so words get finalized without a manual commit.
                 "--asr.endpointing.enable",
             ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=self._proc_log,
+            stderr=self._proc_log,
         )
         logger.info("nemo-speech server spawned (pid {})", self._proc.pid)
 
@@ -121,14 +157,48 @@ class ASREngine:
                 await asyncio.sleep(0.5)
         raise TimeoutError(f"nemo-speech server did not become ready at {url}")
 
+    async def _ensure_server(self) -> None:
+        """Ensure the nemo-speech server process is alive.
+
+        Respawns it (and re-waits for readiness) if it died, counting
+        consecutive respawns: a crash loop gives up after
+        `MAX_SERVER_RESTARTS` so a broken model/config fails loudly
+        instead of restarting forever.
+        """
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            return
+        if proc is not None:
+            logger.error(
+                "nemo-speech server died (exit code {}); see {} for details",
+                proc.returncode, SERVER_LOG_PATH,
+            )
+        if self._restarts >= MAX_SERVER_RESTARTS:
+            raise _RestartLimitReached(
+                f"nemo-speech server restarted {self._restarts} times in a "
+                "row without a live session; check {}".format(SERVER_LOG_PATH)
+            )
+        self._port = _free_port()
+        self._spawn_server()
+        self._restarts += 1
+        await self._wait_ready()
+        logger.info(
+            "nemo-speech server restarted (pid {}, attempt {}/{})",
+            self._proc.pid, self._restarts, MAX_SERVER_RESTARTS,
+        )
+
     async def _run(self) -> None:
         backoff = 0
         while not self._stop.is_set():
             try:
+                await self._ensure_server()
                 await self._stream_session()
                 backoff = 0
             except asyncio.CancelledError:
                 raise
+            except _RestartLimitReached as e:
+                logger.error("ASR engine stopping: {}", e)
+                break
             except Exception as e:
                 logger.warning("ASR session failed: {}; reconnecting", e)
                 await asyncio.sleep(RECONNECT_BACKOFF_S[min(backoff, len(RECONNECT_BACKOFF_S) - 1)])
@@ -166,6 +236,7 @@ class ASREngine:
             import json
 
             await ws.recv()  # session.created
+            self._restarts = 0  # a live session clears the crash-loop count
             await ws.send(json.dumps({
                 "type": "session.update",
                 "session": {

@@ -80,6 +80,11 @@ logos/
   Default `160` (latency/accuracy balance).
 - **Punctuation & capitalization**: the model outputs them natively; they are
   **kept** in the overlay and in keyword matching.
+- **Resilience**: if the `nemo-speech` server process dies, the engine logs
+  the exit code and respawns it (new port, re-wait for readiness). A crash
+  loop (5 consecutive respawns) gives up with a clear error. WebSocket-level
+  failures reconnect with backoff. Server stdout/stderr are appended to
+  `logs/nemo-speech.log` so crashes are diagnosable.
 
 ## 3. Audio Capture
 
@@ -120,12 +125,22 @@ logos/
 
 - Served by the core at `http://127.0.0.1:<port>/` (default port `8765`).
   Intended to be loaded as a **Browser Source** in OBS.
-- WebSocket endpoint `/ws` pushes word/trigger events.
+- WebSocket endpoint `/ws` pushes word/trigger events, plus a
+  `{"type": "ping"}` heartbeat every 15 s for liveness.
+- Connection resilience: uvicorn runs TCP-level WS keepalive
+  (`ws_ping_interval=20`, `ws_ping_timeout=10`); the overlay JS has a
+  stale watchdog (no message for 30 s → close) and auto-reconnects with a
+  1.5 s delay. Silently dead connections recover without a manual refresh.
 - Rendering:
-  - The sliding window of words is shown as a single line/flow.
+  - The sliding window of words is shown as a single centered line.
+  - The **most recent word is anchored at the horizontal center**; older
+    words scroll off to the left. The whole line is moved with a
+    transitioned `transform` (not flex reflow), so it scrolls smoothly with
+    no layout jumps.
   - The **most recent word is highlighted** (bright, `highlight_color`);
-    older words fade with a per-step opacity falloff (`dim_step`), and slide
-    out as new words arrive (CSS transition).
+    older words fade with a per-step opacity falloff (`dim_step`).
+  - **Auto-hide**: after `hide_after_seconds` of silence (no new words) the
+    whole overlay fades out; a new word brings it back. `0` = never hide.
   - Font, size, colors come entirely from config.
   - **Keyword trigger badges**: when enabled, a triggered keyword appears as
     a short-lived animated badge (e.g. "⚡ clip") that fades out after a couple
@@ -193,6 +208,7 @@ overlay:
   color: "#ffffff"
   highlight_color: "#ffd93d"
   dim_step: 0.25            # opacity lost per step back from the newest word
+  hide_after_seconds: 2     # hide overlay after this much silence (0 = never)
   show_keyword_triggers: true
 
 keywords:
@@ -226,7 +242,8 @@ plugins:
 - Endpoints:
   - `GET /` → overlay page
   - `WS /ws` → word/trigger events
-  - `GET /health` → status (ASR loaded, words/sec, plugin states)
+  - `GET /health` → status (ASR loaded, ASR process pid/alive, words/sec,
+    plugin states)
 - The app also hosts the background tasks: audio capture, ASR loop, keyword
   engine, plugin manager.
 

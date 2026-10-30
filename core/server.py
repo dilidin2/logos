@@ -19,6 +19,17 @@ from loguru import logger
 
 OVERLAY_DIR = Path(__file__).parent / "overlay"
 
+# App-level liveness probe: sent to every client so the overlay's stale
+# watchdog (overlay.js) can detect silently dead connections.
+HEARTBEAT_INTERVAL_S = 15
+
+
+async def _heartbeat(core: "Core") -> None:
+    """Periodically ping all overlay clients."""
+    while True:
+        await asyncio.sleep(HEARTBEAT_INTERVAL_S)
+        core.broadcast({"type": "ping"})
+
 from .audio import AudioCapture
 from .asr import ASREngine
 from .keywords import KeywordEngine
@@ -72,6 +83,10 @@ class Core:
         return {
             "status": "ok",
             "asr_loaded": self.asr.loaded,
+            "asr_process": {
+                "pid": self.asr.server_pid,
+                "alive": self.asr.server_alive,
+            },
             "audio": {
                 "captured_seconds": round(self.audio.captured_seconds, 1),
                 "queue_depth": self.audio.queue.qsize(),
@@ -97,11 +112,13 @@ def create_app(core: Core) -> FastAPI:
     async def lifespan(app: FastAPI):
         logger.info("logos starting (host {}:{})",
                     core.config["overlay"]["host"], core.config["overlay"]["port"])
+        heartbeat = asyncio.create_task(_heartbeat(core))
         await core.audio.start()
         await core.asr.start()
         await core.plugins.start()
         await core.keywords.start()
         yield
+        heartbeat.cancel()
         await core.keywords.stop()
         await core.asr.stop()
         await core.plugins.stop()
@@ -143,6 +160,7 @@ def create_app(core: Core) -> FastAPI:
         """Push word/trigger events to the overlay."""
         await ws.accept()
         core.clients.add(ws)
+        logger.info("Overlay client connected ({} total)", len(core.clients))
         try:
             # Keep the socket alive; sends are driven by core.broadcast.
             while True:
@@ -151,6 +169,8 @@ def create_app(core: Core) -> FastAPI:
             pass
         finally:
             core.clients.discard(ws)
+            logger.info("Overlay client disconnected ({} total)",
+                        len(core.clients))
 
     return app
 
@@ -165,4 +185,8 @@ def run(config: dict[str, Any]) -> None:
         host=config["overlay"]["host"],
         port=config["overlay"]["port"],
         log_level="warning",
+        # TCP-level keepalive: uvicorn pings the WS transport so
+        # half-dead connections are torn down on both sides.
+        ws_ping_interval=20,
+        ws_ping_timeout=10,
     )
