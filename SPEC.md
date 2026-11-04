@@ -85,6 +85,13 @@ logos/
   loop (5 consecutive respawns) gives up with a clear error. WebSocket-level
   failures reconnect with backoff. Server stdout/stderr are appended to
   `logs/nemo-speech.log` so crashes are diagnosable.
+- **Server-hang protection**: the audio pump guards every `ws.send` with a
+  timeout (`SEND_TIMEOUT_S`, 10 s). If the server stops draining the socket
+  (app-level hang), the TCP buffer fills and the send would block forever,
+  stalling the whole pipeline. The timeout kills the connection and the
+  session reconnects. Handshake steps (session.created/updated) are
+  similarly bounded. On (re)connect, audio buffered while the session was
+  down is discarded (stale for the new ASR context).
 
 ## 3. Audio Capture
 
@@ -93,6 +100,11 @@ logos/
 - Capture runs on a dedicated thread (PortAudio) writing to an
   `asyncio.Queue`. **Never blocking**: if ASR falls behind, audio is
   dropped (log a warning) rather than blocking the capture thread.
+- **Watchdog**: PortAudio can silently stop delivering callbacks (ALSA
+  `input_overflow` on Linux). Capture errors are counted and logged;
+  a loop-side watchdog detects no-frame delivery for 10 s and re-opens
+  the stream, capped (3 restarts per 10 min) so a broken device fails
+  loudly instead of restarting forever.
 - Graceful shutdown: capture stops cleanly on Ctrl-C.
 
 ## 4. Word Stream & Sliding Window
@@ -246,6 +258,24 @@ plugins:
     plugin states)
 - The app also hosts the background tasks: audio capture, ASR loop, keyword
   engine, plugin manager.
+
+### 9.1 Logging & observability
+
+- Two log sinks (`main.py`):
+  - **terminal**: concise `HH:MM:SS LEVEL message`.
+  - **file** (`logs/logos.log`): detailed `YYYY-MM-DD HH:MM:SS.SSS | LEVEL |
+    module:function:line - message`, rotating at 50 MB, 5 generations kept,
+    `enqueue=True` (thread-safe, non-blocking — the PortAudio thread also
+    logs).
+- A **pipeline monitor** logs every 15 s the state of every stage: audio
+  captured/last-frame age/queue/dropped/overflows, ASR pid/alive, words
+  total/last-word age, overlay clients. After a "subtitles stopped" incident
+  the file log shows which stage went quiet and when.
+- A **no-words watchdog** logs a warning when no word arrives for 30 s
+  (throttled to 1/60 s), and when the pipeline runs 90 s without ever
+  producing a word.
+- An **event-loop lag monitor** logs a warning when a 1 s sleep takes more
+  than 3 s (detects loop-blocking bugs).
 
 ## 10. Non-Goals (v1)
 

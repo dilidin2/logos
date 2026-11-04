@@ -26,6 +26,15 @@ from .wordstream import WordStream
 LANGUAGE_MAP = {"en": "en-US", "it": "it-IT"}
 RECONNECT_BACKOFF_S = (1.0, 2.0, 5.0, 10.0)
 
+# Max time a single ws.send() may block before we consider the server
+# hung. A healthy server drains 32 KB/s of audio; if it stops reading
+# (app-level hang), the kernel TCP buffer fills in seconds and the send
+# blocks forever. The timeout kills the session so it reconnects.
+SEND_TIMEOUT_S = 10.0
+
+# Max time for the session handshake (session.created / session.updated).
+HANDSHAKE_TIMEOUT_S = 15.0
+
 # Server stdout/stderr go here so a crash leaves a diagnosable trace
 # (append mode: previous runs' output is kept).
 SERVER_LOG_PATH = Path("logs") / "nemo-speech.log"
@@ -193,6 +202,9 @@ class ASREngine:
             try:
                 await self._ensure_server()
                 await self._stream_session()
+                # A clean return means the server closed the socket on its
+                # own: log it so a recurring pattern is visible in the file.
+                logger.warning("ASR session closed by server; reconnecting")
                 backoff = 0
             except asyncio.CancelledError:
                 raise
@@ -232,21 +244,32 @@ class ASREngine:
     async def _stream_session(self) -> None:
         language = LANGUAGE_MAP[self._asr_cfg["language"]]
         uri = f"ws://127.0.0.1:{self._port}/v1/audio/transcriptions/realtime"
-        async with websockets.connect(uri) as ws:
+        async with websockets.connect(
+            uri, ping_interval=20, ping_timeout=20,
+        ) as ws:
             import json
 
-            await ws.recv()  # session.created
+            await asyncio.wait_for(
+                ws.recv(), timeout=HANDSHAKE_TIMEOUT_S
+            )  # session.created
             self._restarts = 0  # a live session clears the crash-loop count
-            await ws.send(json.dumps({
+            await asyncio.wait_for(ws.send(json.dumps({
                 "type": "session.update",
                 "session": {
                     "sample_rate": 16000,
                     "language": language,
                     "endpointing_ms": 800,
                 },
-            }))
-            await ws.recv()  # session.updated
+            })), timeout=HANDSHAKE_TIMEOUT_S)
+            await asyncio.wait_for(
+                ws.recv(), timeout=HANDSHAKE_TIMEOUT_S
+            )  # session.updated
             self._reset_utterance()
+
+            # Discard audio buffered while the session was down: it is
+            # stale for the new ASR context and would transcribe as a
+            # burst of old speech.
+            self._drain_stale_audio()
 
             send_task = asyncio.create_task(self._pump_audio(ws))
             try:
@@ -259,6 +282,83 @@ class ASREngine:
                         self._finalize_utterance()
             finally:
                 send_task.cancel()
+                # Retrieve the task so a failed/cancelled pump never dies
+                # silently; its own errors are already logged in
+                # _pump_audio before it exits.
+                try:
+                    await asyncio.wait_for(send_task, timeout=1.0)
+                except BaseException:
+                    pass
+
+    def _drain_stale_audio(self) -> None:
+        """Drop capture-queue frames buffered while the session was down."""
+        queue = self._audio_queue
+        dropped = 0
+        while True:
+            try:
+                queue.get_nowait()
+                dropped += 1
+            except asyncio.QueueEmpty:
+                break
+        if dropped:
+            logger.info(
+                "ASR session connected: discarded {} stale audio frame(s)",
+                dropped,
+            )
+
+    @staticmethod
+    def _kill_connection(ws) -> None:
+        """Abruptly close the TCP transport.
+
+        A graceful close handshake (ws.close) would itself block on a
+        full send buffer; aborting the transport guarantees any blocked
+        send and any blocked recv fail immediately with ConnectionClosed,
+        tearing the session down so the loop can reconnect.
+        """
+        transport = getattr(ws, "transport", None)
+        if transport is not None:
+            transport.close()
+
+    async def _pump_audio(self, ws) -> None:
+        """Forward capture-queue frames to the realtime socket.
+
+        Every send is guarded by SEND_TIMEOUT_S: if the nemo-speech
+        server stops draining the socket (app-level hang), the TCP
+        buffer fills and the send blocks forever. The timeout kills the
+        connection so the session loop reconnects instead of stalling
+        the whole pipeline. Any other failure is logged, kills the
+        connection (unblocking the receive loop) and propagates.
+        """
+        queue = self._audio_queue
+        frames_sent = 0
+        try:
+            while not self._stop.is_set():
+                frame = await queue.get()
+                try:
+                    await asyncio.wait_for(ws.send(frame), timeout=SEND_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "nemo-speech stopped reading audio: ws.send blocked "
+                        "for {:.0f}s after {} frame(s) — killing session to "
+                        "reconnect", SEND_TIMEOUT_S, frames_sent,
+                    )
+                    self._kill_connection(ws)
+                    raise ConnectionError(
+                        "audio send blocked; session killed"
+                    ) from None
+                frames_sent += 1
+        except asyncio.CancelledError:
+            logger.debug(
+                "audio pump cancelled ({} frame(s) sent this session)",
+                frames_sent,
+            )
+            raise
+        except ConnectionError:
+            raise  # already logged by the timeout handler above
+        except Exception as e:
+            logger.error("audio pump failed: {} — killing connection", e)
+            self._kill_connection(ws)
+            raise
 
     def _finalize_utterance(self) -> None:
         """Finalize all open words of the current utterance."""
@@ -272,13 +372,6 @@ class ASREngine:
         for index in self._open_indices:
             self._words.mark_final(index)
         self._open_indices = []
-
-    async def _pump_audio(self, ws) -> None:
-        """Forward capture-queue frames to the realtime socket."""
-        queue = self._audio_queue
-        while not self._stop.is_set():
-            frame = await queue.get()
-            await ws.send(frame)
 
     @property
     def _audio_queue(self):
