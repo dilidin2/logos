@@ -10,10 +10,12 @@ as interim events; utterance `completed` events finalize them
 from __future__ import annotations
 
 import asyncio
+import math
 import shutil
 import socket
 import subprocess
 import time
+from array import array
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +36,21 @@ SEND_TIMEOUT_S = 10.0
 
 # Max time for the session handshake (session.created / session.updated).
 HANDSHAKE_TIMEOUT_S = 15.0
+
+# App-level liveness (the send timeout cannot catch this): the server can
+# keep draining the socket while its inference pipeline hangs, producing
+# no events at all. If the user is speaking (measured by the pump) but no
+# word is produced for WORD_STALL_TIMEOUT_S, the session is unhealthy and
+# gets killed; a second stall within ESCALATION_WINDOW_S means the server
+# itself is suspect and gets respawned.
+WORD_STALL_TIMEOUT_S = 60.0
+WORD_STALL_CHECK_INTERVAL_S = 5.0
+# Speech was measured within this window => the user is speaking.
+SPEECH_RECENT_S = 30.0
+# RMS threshold (0-32767 scale) above which a frame counts as speech.
+SPEECH_RMS_THRESHOLD = 200.0
+# A second stall within this window escalates to a server respawn.
+ESCALATION_WINDOW_S = 300.0
 
 # Server stdout/stderr go here so a crash leaves a diagnosable trace
 # (append mode: previous runs' output is kept).
@@ -85,6 +102,13 @@ class ASREngine:
         self._pending_punct = ""
         self._open_indices: list[int] = []
         self.loaded = False
+        # Word-stall watchdog state (see _word_stall_watchdog).
+        self._last_word_emit_at: float | None = None
+        self._last_speech_at: float | None = None
+        self._last_recovery_at: float | None = None
+        self._recovery_count = 0
+        self._session_ws: Any = None
+        self._stall_task: asyncio.Task | None = None
 
     async def start(self) -> None:
         """Start the nemo-speech server and the streaming loop."""
@@ -92,6 +116,9 @@ class ASREngine:
         self._spawn_server()
         await self._wait_ready()
         self._task = asyncio.create_task(self._run(), name="asr-loop")
+        self._stall_task = asyncio.create_task(
+            self._word_stall_watchdog(), name="asr-stall-watchdog"
+        )
         logger.info("ASR engine started (nemo-speech on port {})", self._port)
 
     @property
@@ -104,8 +131,21 @@ class ASREngine:
         """Whether the nemo-speech server process is currently alive."""
         return self._proc is not None and self._proc.poll() is None
 
+    @property
+    def last_speech_at(self) -> float | None:
+        """Monotonic time the pump last measured speech (None until first)."""
+        return self._last_speech_at
+
+    @property
+    def recovery_count(self) -> int:
+        """How many word-stall recoveries happened in this run."""
+        return self._recovery_count
+
     async def stop(self) -> None:
         self._stop.set()
+        if self._stall_task is not None:
+            self._stall_task.cancel()
+            self._stall_task = None
         if self._task is not None:
             self._task.cancel()
         if self._proc is not None:
@@ -223,6 +263,7 @@ class ASREngine:
         self._open_indices = []
 
     def _emit_word(self, word: str) -> None:
+        self._last_word_emit_at = time.monotonic()
         # RNNT tokens sometimes detach punctuation (e.g. '. A sk' for
         # '. Ask'): re-attach a punct-only token to the next word.
         if not any(ch.isalnum() for ch in word):
@@ -249,46 +290,50 @@ class ASREngine:
         ) as ws:
             import json
 
-            await asyncio.wait_for(
-                ws.recv(), timeout=HANDSHAKE_TIMEOUT_S
-            )  # session.created
-            self._restarts = 0  # a live session clears the crash-loop count
-            await asyncio.wait_for(ws.send(json.dumps({
-                "type": "session.update",
-                "session": {
-                    "sample_rate": 16000,
-                    "language": language,
-                    "endpointing_ms": 800,
-                },
-            })), timeout=HANDSHAKE_TIMEOUT_S)
-            await asyncio.wait_for(
-                ws.recv(), timeout=HANDSHAKE_TIMEOUT_S
-            )  # session.updated
-            self._reset_utterance()
-
-            # Discard audio buffered while the session was down: it is
-            # stale for the new ASR context and would transcribe as a
-            # burst of old speech.
-            self._drain_stale_audio()
-
-            send_task = asyncio.create_task(self._pump_audio(ws))
+            self._session_ws = ws
             try:
-                async for raw in ws:
-                    event = json.loads(raw)
-                    etype = event.get("type", "")
-                    if etype == "conversation.item.input_audio_transcription.delta":
-                        self._feed_delta(event.get("delta", ""))
-                    elif etype == "conversation.item.input_audio_transcription.completed":
-                        self._finalize_utterance()
-            finally:
-                send_task.cancel()
-                # Retrieve the task so a failed/cancelled pump never dies
-                # silently; its own errors are already logged in
-                # _pump_audio before it exits.
+                await asyncio.wait_for(
+                    ws.recv(), timeout=HANDSHAKE_TIMEOUT_S
+                )  # session.created
+                self._restarts = 0  # a live session clears the crash-loop count
+                await asyncio.wait_for(ws.send(json.dumps({
+                    "type": "session.update",
+                    "session": {
+                        "sample_rate": 16000,
+                        "language": language,
+                        "endpointing_ms": 800,
+                    },
+                })), timeout=HANDSHAKE_TIMEOUT_S)
+                await asyncio.wait_for(
+                    ws.recv(), timeout=HANDSHAKE_TIMEOUT_S
+                )  # session.updated
+                self._reset_utterance()
+
+                # Discard audio buffered while the session was down: it is
+                # stale for the new ASR context and would transcribe as a
+                # burst of old speech.
+                self._drain_stale_audio()
+
+                send_task = asyncio.create_task(self._pump_audio(ws))
                 try:
-                    await asyncio.wait_for(send_task, timeout=1.0)
-                except BaseException:
-                    pass
+                    async for raw in ws:
+                        event = json.loads(raw)
+                        etype = event.get("type", "")
+                        if etype == "conversation.item.input_audio_transcription.delta":
+                            self._feed_delta(event.get("delta", ""))
+                        elif etype == "conversation.item.input_audio_transcription.completed":
+                            self._finalize_utterance()
+                finally:
+                    send_task.cancel()
+                    # Retrieve the task so a failed/cancelled pump never
+                    # dies silently; its own errors are already logged in
+                    # _pump_audio before it exits.
+                    try:
+                        await asyncio.wait_for(send_task, timeout=1.0)
+                    except BaseException:
+                        pass
+            finally:
+                self._session_ws = None
 
     def _drain_stale_audio(self) -> None:
         """Drop capture-queue frames buffered while the session was down."""
@@ -319,6 +364,79 @@ class ASREngine:
         if transport is not None:
             transport.close()
 
+    async def _word_stall_watchdog(self) -> None:
+        """Detect a hung inference pipeline (no words while the user speaks).
+
+        The nemo-speech server can keep draining the realtime socket
+        while its ASR pipeline hangs: sends succeed (the send timeout
+        never fires), the process stays alive, yet no transcription
+        event is ever produced. The only observable difference is
+        "the user is speaking but no word comes out", so this watchdog
+        watches exactly that: speech measured by the pump plus a
+        word-less gap of WORD_STALL_TIMEOUT_S kills the session so the
+        loop reconnects. A second stall within ESCALATION_WINDOW_S
+        means the server itself is suspect: the process is respawned
+        too (a fresh session on a hung server hangs again).
+        """
+        while not self._stop.is_set():
+            await asyncio.sleep(WORD_STALL_CHECK_INTERVAL_S)
+            try:
+                await self._check_word_stall()
+            except Exception as e:
+                # The watchdog is a safety task: an unexpected error must
+                # not kill it, or recovery would stop working silently.
+                logger.error("word-stall watchdog error: {}", e)
+
+    async def _check_word_stall(self) -> None:
+        """One watchdog iteration (see _word_stall_watchdog)."""
+        last_speech = self._last_speech_at
+        if (last_speech is None or
+                time.monotonic() - last_speech > SPEECH_RECENT_S):
+            return  # user not speaking: silence is expected
+        if self._session_ws is None:
+            return  # between sessions (reconnect in progress)
+        last_word = self._last_word_emit_at
+        if last_word is not None and \
+                time.monotonic() - last_word < WORD_STALL_TIMEOUT_S:
+            return  # words are flowing
+        await self._recover_from_stall()
+
+    async def _recover_from_stall(self) -> None:
+        """Kill the hung session; respawn the server if it stalled again."""
+        last_word = self._last_word_emit_at
+        silence = (
+            time.monotonic() - last_word if last_word is not None else float("inf")
+        )
+        escalating = (
+            self._last_recovery_at is not None and
+            time.monotonic() - self._last_recovery_at < ESCALATION_WINDOW_S
+        )
+        self._recovery_count += 1
+        if escalating:
+            logger.error(
+                "ASR stalled again: no words for {:.0f}s shortly after "
+                "recovery #{} — respawning the nemo-speech server", silence,
+                self._recovery_count - 1,
+            )
+            self._kill_server_process()
+        else:
+            logger.error(
+                "ASR stalled: no words for {:.0f}s while the user is "
+                "speaking (server still drains the socket) — killing "
+                "session to reconnect", silence,
+            )
+        ws = self._session_ws
+        if ws is not None:
+            self._kill_connection(ws)
+        self._last_recovery_at = time.monotonic()
+
+    def _kill_server_process(self) -> None:
+        """Terminate the nemo-speech server; the run loop respawns it."""
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            logger.info("terminating nemo-speech server (pid {})", proc.pid)
+            proc.terminate()
+
     async def _pump_audio(self, ws) -> None:
         """Forward capture-queue frames to the realtime socket.
 
@@ -328,12 +446,16 @@ class ASREngine:
         connection so the session loop reconnects instead of stalling
         the whole pipeline. Any other failure is logged, kills the
         connection (unblocking the receive loop) and propagates.
+
+        Each frame's energy is also measured so the word-stall watchdog
+        knows whether the user is speaking.
         """
         queue = self._audio_queue
         frames_sent = 0
         try:
             while not self._stop.is_set():
                 frame = await queue.get()
+                self._note_speech(frame)
                 try:
                     await asyncio.wait_for(ws.send(frame), timeout=SEND_TIMEOUT_S)
                 except asyncio.TimeoutError:
@@ -359,6 +481,14 @@ class ASREngine:
             logger.error("audio pump failed: {} — killing connection", e)
             self._kill_connection(ws)
             raise
+
+    def _note_speech(self, frame: bytes) -> None:
+        """Measure frame RMS to track whether the user is speaking."""
+        samples = array("h")
+        samples.frombytes(frame)
+        rms = math.sqrt(sum(s * s for s in samples) / len(samples))
+        if rms >= SPEECH_RMS_THRESHOLD:
+            self._last_speech_at = time.monotonic()
 
     def _finalize_utterance(self) -> None:
         """Finalize all open words of the current utterance."""

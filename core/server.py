@@ -62,10 +62,15 @@ async def _pipeline_monitor(core: "Core") -> None:
             time.monotonic() - core.last_word_at
             if core.last_word_at is not None else None
         )
+        last_speech_age = (
+            time.monotonic() - core.asr.last_speech_at
+            if core.asr.last_speech_at is not None else None
+        )
         logger.info(
             "pipeline | audio: captured={:.1f}s last_frame={} queue={} "
             "dropped={} overflows={} | asr: pid={} alive={} | words: "
-            "total={} last_word={} | clients={}",
+            "total={} last_word={} | speech: last_speech={} recoveries={} "
+            "| clients={}",
             audio.captured_seconds,
             f"{last_frame_age:.1f}s" if last_frame_age is not None else "n/a",
             audio.queue.qsize(),
@@ -75,6 +80,8 @@ async def _pipeline_monitor(core: "Core") -> None:
             core.asr.server_alive,
             core.words.total_words,
             f"{last_word_age:.1f}s" if last_word_age is not None else "n/a",
+            f"{last_speech_age:.1f}s" if last_speech_age is not None else "n/a",
+            core.asr.recovery_count,
             len(core.clients),
         )
         now = time.monotonic()

@@ -85,13 +85,28 @@ logos/
   loop (5 consecutive respawns) gives up with a clear error. WebSocket-level
   failures reconnect with backoff. Server stdout/stderr are appended to
   `logs/nemo-speech.log` so crashes are diagnosable.
-- **Server-hang protection**: the audio pump guards every `ws.send` with a
-  timeout (`SEND_TIMEOUT_S`, 10 s). If the server stops draining the socket
-  (app-level hang), the TCP buffer fills and the send would block forever,
-  stalling the whole pipeline. The timeout kills the connection and the
-  session reconnects. Handshake steps (session.created/updated) are
-  similarly bounded. On (re)connect, audio buffered while the session was
-  down is discarded (stale for the new ASR context).
+- **Server-hang protection (TCP level)**: the audio pump guards every
+  `ws.send` with a timeout (`SEND_TIMEOUT_S`, 10 s). If the server stops
+  draining the socket (app-level hang), the TCP buffer fills and the send
+  would block forever, stalling the whole pipeline. The timeout kills the
+  connection and the session reconnects. Handshake steps
+  (session.created/updated) are similarly bounded. On (re)connect, audio
+  buffered while the session was down is discarded (stale for the new ASR
+  context).
+- **Server-hang protection (app level, word-stall watchdog):** the
+  nemo-speech server can keep draining the realtime socket while its
+  inference pipeline hangs (observed: 12+ min of audio accepted, zero
+  transcription events, process alive, sends never blocked). The send
+  timeout cannot catch this, so the engine also watches "the user is
+  speaking but no word comes out": the audio pump measures each frame's
+  RMS, and if speech was measured within `SPEECH_RECENT_S` (30 s) while no
+  word is produced for `WORD_STALL_TIMEOUT_S` (60 s), the session is
+  unhealthy and gets killed so the loop reconnects. A second stall within
+  `ESCALATION_WINDOW_S` (5 min) means the server itself is suspect: the
+  process is respawned too (a fresh session on a hung server hangs again).
+  The watchdog is a safety task: unexpected errors inside it are logged,
+  never fatal. It only fires while the user is actually speaking, so long
+  silences do not cause spurious reconnects.
 
 ## 3. Audio Capture
 
