@@ -3,3 +3,4 @@ models/*.gguf
 __pycache__/
 *.pyc
 logs/
+config/logos_config.yaml

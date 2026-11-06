@@ -16,6 +16,7 @@ overlay:
   color: "#ffffff"
   highlight_color: "#ffd93d"
   dim_step: 0.25            # opacity lost per step back from the newest word
+  hide_after_seconds: 2     # hide overlay after this much silence (0 = never)
   show_keyword_triggers: true
 
 keywords:

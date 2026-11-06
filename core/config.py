@@ -72,6 +72,12 @@ def _validate_overlay(config: dict[str, Any]) -> None:
     dim_step = _require(section, "dim_step", "overlay")
     if not (0 <= dim_step <= 1):
         raise ConfigError(f"overlay.dim_step must be in [0, 1], got {dim_step}.")
+    hide_after = section.get("hide_after_seconds", 0)
+    if not isinstance(hide_after, (int, float)) or hide_after < 0:
+        raise ConfigError(
+            "overlay.hide_after_seconds must be a non-negative number, "
+            f"got {hide_after!r}."
+        )
 
 
 def _validate_keywords(config: dict[str, Any]) -> None:

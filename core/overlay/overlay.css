@@ -16,29 +16,40 @@ html, body {
 body {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: center;
   font-family: var(--font-family);
   font-size: var(--font-size);
 }
+/* Full-width viewport; the track inside is translated so the newest
+   word sits at the horizontal center. */
 #words {
+  position: relative;
+  width: 100%;
+  height: 100%;
   display: flex;
+  align-items: center;
+  overflow: hidden;
+  transition: opacity 600ms ease;
+}
+#words.hidden {
+  opacity: 0;
+}
+#track {
+  display: inline-flex;
   align-items: baseline;
   white-space: nowrap;
-  padding: 0 24px;
+  will-change: transform;
+  transition: transform 300ms ease;
 }
 .word {
   color: var(--color);
   opacity: 1;
   margin-right: 0.35em;
-  transition: opacity 300ms ease, transform 300ms ease;
-  will-change: opacity, transform;
+  transition: opacity 300ms ease;
+  will-change: opacity;
 }
 .word.latest {
   color: var(--highlight-color);
-}
-.word.sliding-out {
-  opacity: 0 !important;
-  transform: translateX(-0.6em);
 }
 #badges {
   position: fixed;

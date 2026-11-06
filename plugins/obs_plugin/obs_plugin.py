@@ -57,11 +57,11 @@ class ObsPlugin(Plugin):
                 self._client = client
                 backoff = 0
                 logger.info("OBS connected ({}:{})", self._host, self._port)
-                # Detect silent disconnects: any request will fail.
-                await asyncio.to_thread(
-                    client.req, "GetVersion", None
-                )
-                await asyncio.sleep(5.0)
+                # Stay connected; poll a cheap request to detect silent
+                # disconnects (any request will fail once the socket dies).
+                while not self._stop.is_set():
+                    await asyncio.to_thread(client.req, "GetVersion", None)
+                    await asyncio.sleep(5.0)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
